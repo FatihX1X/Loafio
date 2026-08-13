@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loaf-podium-maker"
+version = "1.0.0"
+description = "Autonomous inventory-bounded maker bot for League of Loaf"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "loaf-bot @ git+https://github.com/Loaf-Markets/loaf-python-api-bot-template.git@e1157bcc2cba41fcde6e0f929cc58ad61bc4d442",
+  "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-cov>=5,<6",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+loaf-maker = "loaf_bot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["loaf_bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
