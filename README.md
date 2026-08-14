@@ -5,24 +5,33 @@
 Loafio is an autonomous, inventory-bounded market-making bot for the League of
 Loaf competition. It runs locally on Windows and quotes the active `terafab`
 order book with maker-first execution, inventory skew, podium-pace sizing, and
-session-level risk controls.
+automatic stale-state recovery and watchdog restarts.
 
 > [!CAUTION]
 > `run.cmd` starts live competition trading without asking for confirmation.
 > There is no guarantee of profit, podium placement, execution quality, or a
-> maximum realised loss. Gaps, latency, disconnections, and insufficient
-> liquidity can cause losses beyond the configured threshold.
+> maximum realised loss. There is no equity-loss cutoff: the bot keeps running
+> until you stop it. It can lose the entire competition balance.
 
 ## Strategy overview
 
 - Keeps normal orders passive to avoid taker fees where possible.
-- Targets 30,000 USDL of Terafab inventory with a hard 60,000 USDL cap.
+- Uses 15,000 USDL per side normally, 25,000 in catch-up, and up to 40,000 USDL
+  in sprint mode when far behind podium pace.
+- Targets 30,000 USDL of Terafab inventory with a hard 80,000 USDL cap.
 - Skews buy and sell size according to current inventory.
 - Preserves queue priority and replaces orders only when price, fill, or risk
   conditions require it.
 - Tracks short- and medium-term leaderboard pace without deliberately crossing
   the spread.
 - Blocks self-trades and refuses to run with unrecognised active orders.
+- Clears locally stale orders when Loaf reports that they are already terminal.
+- Requests a watchdog restart when the same self-trade block repeats six times
+  within ten seconds.
+- Treats exchange-wide trading halts as temporary: it pauses order actions and
+  retries automatically instead of stopping the watchdog.
+- Cancels unknown active orders during startup and restarts reconciliation
+  automatically instead of requiring manual cleanup.
 - Uses taker orders only for emergency or manual flattening.
 - Stores sessions, orders, fills, nonces, fees, equity snapshots, leaderboard
   snapshots, and watchdog restarts in SQLite.
@@ -30,20 +39,22 @@ session-level risk controls.
 This design is inventory-neutral rather than truly delta-neutral: Loaf does not
 provide a separate hedge instrument for the Terafab exposure.
 
-## Risk model
+## Runtime and risk model
 
 Every manual `run.cmd` invocation creates a new session and records its starting
-equity. The session loss floor is 75% of that value, corresponding to a 25%
-drawdown limit.
+equity for reporting. Equity is monitored and persisted, but it does not stop,
+lock, or flatten the session. The bot continues until `Ctrl+C`, a permanent
+preflight/configuration failure, or a manual `flatten` command.
 
-If the Python process crashes, the PowerShell watchdog restarts it with the same
-session ID and the same loss floor. If the floor is reached, the bot stops
-quoting, cancels its orders, attempts to sell the remaining Terafab position,
-and locks the session against watchdog restarts.
+If the Python process crashes or detects a repeated stale-order/self-trade loop,
+the PowerShell watchdog restarts it after five seconds with the same session ID.
+Startup reconciliation then replaces stale local order state with the exchange's
+active-order snapshot. The 80,000 USDL inventory cap and market-data safety
+pauses remain enabled, but neither is an account-level loss limit.
 
-The 25% value is a trigger, not a guaranteed stop price. Market gaps, stale
-prices, unavailable liquidity, API failures, or connection loss can produce a
-larger realised loss.
+When Loaf activates its exchange-wide trading halt, new orders and cancellations
+are unavailable server-side. Loafio stays alive, waits 15 seconds between startup
+checks, and resumes automatically after Loaf reopens trading.
 
 ## Requirements
 
@@ -116,14 +127,12 @@ passive sell for up to 30 seconds, and then market-sells any remaining Terafab.
 ## Operations
 
 ```powershell
-# Show the latest local session and risk state
+# Show the latest local session, equity, volume, and inventory state
 .\.venv\Scripts\python.exe -m loaf_bot status
 
 # Cancel all orders and market-sell the Terafab position
 .\.venv\Scripts\python.exe -m loaf_bot flatten
 
-# Archive the latest risk lock before a new manual session
-.\.venv\Scripts\python.exe -m loaf_bot unlock
 ```
 
 `flatten` is destructive: it liquidates the current Terafab position using a
@@ -144,7 +153,7 @@ Runtime data is written to:
 
 The offline suite covers rounding, inventory skew, podium pace, partial fills,
 nonce uniqueness, HTTP ambiguity, self-trade prevention, emergency flattening,
-session persistence, risk locks, stale data, and WebSocket reconciliation.
+session persistence, automatic loop restarts, stale data, and WebSocket reconciliation.
 
 ## Security
 

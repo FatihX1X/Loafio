@@ -101,14 +101,14 @@ class Store:
         session_id: str,
         equity: float,
         lifetime_volume: float,
-        loss_fraction: float,
+        _legacy_loss_fraction: float | None = None,
     ) -> SessionRecord:
         with self._lock, self._db:
             row = self._db.execute(
                 "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
             if row is None:
-                floor = equity * (1.0 - loss_fraction)
+                floor = 0.0
                 self._db.execute(
                     """INSERT INTO sessions
                     (session_id, created_at, start_equity, start_volume,
@@ -118,7 +118,18 @@ class Store:
                 )
                 self.event(session_id, "session_started", {"equity": equity, "floor": floor})
                 return SessionRecord(session_id, equity, lifetime_volume, floor, "ACTIVE", equity)
-            return self._record(row)
+            # Loss locking was removed. Re-enable sessions created by an older
+            # version and retain the column only for database compatibility.
+            self._db.execute(
+                """UPDATE sessions
+                SET loss_floor=0, status='ACTIVE', ended_at=NULL, lock_reason=NULL
+                WHERE session_id=? AND status IN ('ACTIVE', 'RISK_LOCKED')""",
+                (session_id,),
+            )
+            refreshed = self._db.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            return self._record(refreshed)
 
     @staticmethod
     def _record(row: sqlite3.Row) -> SessionRecord:

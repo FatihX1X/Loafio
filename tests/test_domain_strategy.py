@@ -44,14 +44,57 @@ def test_neutral_inventory_quotes_both_sides(config):
     assert decision.pause_reason is None
     assert decision.bid is not None and decision.bid.price == 99.99
     assert decision.ask is not None and decision.ask.price == 100.0
+    assert decision.bid.notional == pytest.approx(14_998.5)
+    assert decision.ask.notional == pytest.approx(15_000.0)
     assert decision.bid.price < decision.ask.price
+
+
+def test_sprint_mode_uses_forty_thousand_usdl_quotes(config):
+    now_mono = time.monotonic()
+    now_wall = time.time()
+    state = ready_state(now_mono)
+    state.lifetime_volume = 0
+    state.round_ends_at = now_wall + 3_600
+    state.rank3_samples.extend([(now_wall - 60, 1_000), (now_wall, 2_000)])
+    decision = MakerStrategy(config).decide(
+        state,
+        session_start_volume=0,
+        now_mono=now_mono,
+        now_wall=now_wall,
+    )
+    assert decision.catchup is True
+    assert decision.pace_mode == "sprint"
+    assert decision.bid is not None and decision.bid.notional == pytest.approx(39_996.0)
+    # The sell remains bounded by actual inventory even in sprint mode.
+    assert decision.ask is not None and decision.ask.notional == pytest.approx(30_000.0)
+
+
+def test_pace_uses_restart_stable_lifetime_volume(config):
+    now = time.time()
+    state = LiveState(lifetime_volume=900_000, round_ends_at=now + 3_600)
+    state.rank3_samples.append((now, 1_000_000))
+    assert MakerStrategy(config).pace_mode(state, now) == "normal"
+
+
+def test_catchup_mode_is_between_sprint_and_normal(config):
+    now = time.time()
+    state = LiveState(lifetime_volume=500_000, round_ends_at=now + 3_600)
+    state.rank3_samples.append((now, 1_000_000))
+    assert MakerStrategy(config).pace_mode(state, now) == "catchup"
+
+
+def test_zero_round_volume_does_not_fall_back_to_lifetime(config):
+    now = time.time()
+    state = LiveState(lifetime_volume=9_000_000, round_volume=0, round_ends_at=now + 3_600)
+    state.rank3_samples.append((now, 1_000_000))
+    assert MakerStrategy(config).pace_mode(state, now) == "sprint"
 
 
 def test_inventory_cap_disables_buy(config):
     now = time.monotonic()
     state = ready_state(now)
-    state.total_quantity = 600
-    state.available_quantity = 600
+    state.total_quantity = 800
+    state.available_quantity = 800
     state.cash = 40_000
     decision = MakerStrategy(config).decide(
         state, session_start_volume=0, now_mono=now, now_wall=time.time()
@@ -124,7 +167,7 @@ def test_existing_sell_reservation_is_counted_as_sellable(config):
         state, session_start_volume=0, now_mono=now, now_wall=time.time()
     )
     assert decision.ask is not None
-    assert decision.ask.quantity == 100
+    assert decision.ask.quantity == 150
 
 
 def test_existing_buy_reservation_is_counted_as_available_cash(config):

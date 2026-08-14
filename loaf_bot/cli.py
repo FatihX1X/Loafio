@@ -8,16 +8,17 @@ from .config import BotConfig, ConfigError, LocalConfig
 from .engine import (
     MakerBot,
     PreflightError,
-    RiskLockTriggered,
+    RestartRequired,
+    TradingPaused,
     configure_logging,
     flatten_account,
 )
 from .storage import Store
 
-EXIT_RISK_LOCKED = 25
 EXIT_CONFIG = 64
 EXIT_PREFLIGHT = 65
 EXIT_RESTART = 70
+EXIT_TRADING_PAUSED = 71
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -26,7 +27,6 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("live", help="start autonomous live trading immediately")
     sub.add_parser("status", help="show the latest local session")
     sub.add_parser("flatten", help="cancel all orders and market-sell available terafab")
-    sub.add_parser("unlock", help="archive the latest risk-locked session")
     return parser
 
 
@@ -47,7 +47,7 @@ def _status() -> int:
         print(f"start_equity: {session.start_equity:.2f}")
         print(f"last_equity: {session.last_equity:.2f}")
         print(f"drawdown: {drawdown:.2f}")
-        print(f"loss_floor: {session.loss_floor:.2f}")
+        print("loss_limit: disabled")
         metrics = store.metrics(session.session_id)
         if metrics is not None:
             print(f"inventory_usdl: {metrics.inventory:.2f}")
@@ -55,19 +55,6 @@ def _status() -> int:
             print(f"podium_target: {metrics.podium_target:.2f}")
             print(f"catchup: {metrics.catchup}")
             print(f"metrics_updated_at: {metrics.updated_at:.0f}")
-        return 0
-    finally:
-        store.close()
-
-
-def _unlock() -> int:
-    config = LocalConfig.load()
-    store = Store(config.db_path)
-    try:
-        if store.archive_locked():
-            print("Latest risk lock archived. A new manual run.ps1 starts a new loss budget.")
-        else:
-            print("No risk-locked session found.")
         return 0
     finally:
         store.close()
@@ -89,9 +76,12 @@ def _live() -> int:
         graceful = True
         bot.request_stop()
         return 0
-    except RiskLockTriggered as exc:
-        print(f"Risk lock: {exc}", file=sys.stderr)
-        return EXIT_RISK_LOCKED
+    except RestartRequired as exc:
+        print(f"Watchdog restart requested: {exc}", file=sys.stderr)
+        return EXIT_RESTART
+    except TradingPaused as exc:
+        print(f"Trading paused: {exc}", file=sys.stderr)
+        return EXIT_TRADING_PAUSED
     except PreflightError as exc:
         print(f"Preflight failed: {exc}", file=sys.stderr)
         return EXIT_PREFLIGHT
@@ -106,8 +96,6 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "status":
         return _status()
-    if args.command == "unlock":
-        return _unlock()
     if args.command == "flatten":
         try:
             flatten_account(BotConfig.load(require_session=False))

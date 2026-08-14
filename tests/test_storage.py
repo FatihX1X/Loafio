@@ -3,30 +3,29 @@ from __future__ import annotations
 from loaf_bot.storage import Store
 
 
-def test_watchdog_restart_preserves_original_loss_floor(tmp_path):
+def test_watchdog_restart_preserves_session_with_loss_limit_disabled(tmp_path):
     store = Store(tmp_path / "state.sqlite3")
     try:
-        first = store.open_session("same", 100_000, 1_000, 0.25)
-        restarted = store.open_session("same", 80_000, 2_000, 0.25)
-        assert first.loss_floor == 75_000
+        first = store.open_session("same", 100_000, 1_000)
+        restarted = store.open_session("same", 80_000, 2_000)
+        assert first.loss_floor == 0
         assert restarted.start_equity == 100_000
-        assert restarted.loss_floor == 75_000
+        assert restarted.loss_floor == 0
 
-        manual_new = store.open_session("new", 80_000, 2_000, 0.25)
-        assert manual_new.loss_floor == 60_000
+        manual_new = store.open_session("new", 80_000, 2_000)
+        assert manual_new.loss_floor == 0
     finally:
         store.close()
 
 
-def test_risk_lock_and_unlock_are_persistent(tmp_path):
+def test_legacy_risk_lock_is_reactivated_on_restart(tmp_path):
     store = Store(tmp_path / "state.sqlite3")
     try:
         store.open_session("same", 100_000, 0, 0.25)
         store.lock_session("same", "test", 74_999)
-        restarted = store.open_session("same", 90_000, 0, 0.25)
-        assert restarted.status == "RISK_LOCKED"
-        assert store.archive_locked() is True
-        assert store.latest_session().status == "ARCHIVED"
+        restarted = store.open_session("same", 90_000, 0)
+        assert restarted.status == "ACTIVE"
+        assert restarted.loss_floor == 0
     finally:
         store.close()
 
