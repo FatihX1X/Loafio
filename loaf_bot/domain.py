@@ -55,6 +55,7 @@ class LiveState:
     frozen: float = 0.0
     portfolio_value: float = 0.0
     lifetime_volume: float = 0.0
+    round_volume: float | None = None
     available_quantity: float = 0.0
     total_quantity: float = 0.0
     market_price: float = 0.0

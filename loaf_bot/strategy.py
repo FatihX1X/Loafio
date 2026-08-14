@@ -13,6 +13,7 @@ class StrategyDecision:
     ask: Quote | None
     pause_reason: str | None = None
     catchup: bool = False
+    pace_mode: str = "normal"
 
 
 class MakerStrategy:
@@ -39,14 +40,20 @@ class MakerStrategy:
         projected = current + rate * max(0.0, state.round_ends_at - now)
         return projected * 1.10, rate
 
-    def is_catchup(self, state: LiveState, session_start_volume: float, now_wall: float) -> bool:
+    def pace_mode(self, state: LiveState, now_wall: float) -> str:
         target, _ = self.podium_target(state, now_wall)
         if target <= 0 or state.round_ends_at <= now_wall:
-            return False
-        own_volume = max(0.0, state.lifetime_volume - session_start_volume)
-        remaining = state.round_ends_at - now_wall
-        required_rate = max(0.0, target - own_volume) / remaining
-        return required_rate > 0
+            return "normal"
+        # Leaderboard volume is round-scoped. Until our own entry can be matched,
+        # lifetime volume is a better restart-stable fallback than session delta.
+        source_volume = state.lifetime_volume if state.round_volume is None else state.round_volume
+        own_volume = max(0.0, source_volume)
+        ratio = own_volume / target
+        if ratio < self.config.sprint_pace_ratio:
+            return "sprint"
+        if ratio < self.config.catchup_pace_ratio:
+            return "catchup"
+        return "normal"
 
     def decide(
         self,
@@ -89,8 +96,14 @@ class MakerStrategy:
         if bid_price >= ask_price:
             return StrategyDecision(None, None, "no passive spread")
 
-        catchup = self.is_catchup(state, session_start_volume, wall)
-        full = self.config.catchup_quote_usdl if catchup else self.config.base_quote_usdl
+        pace_mode = self.pace_mode(state, wall)
+        catchup = pace_mode != "normal"
+        if pace_mode == "sprint":
+            full = self.config.sprint_quote_usdl
+        elif pace_mode == "catchup":
+            full = self.config.catchup_quote_usdl
+        else:
+            full = self.config.base_quote_usdl
         reduced = full / 2
         inventory = state.inventory_notional()
         active_buy = state.bot_orders.get("BUY")
@@ -135,4 +148,4 @@ class MakerStrategy:
         )
         bid = Quote("BUY", round_price(bid_price), bid_qty) if bid_qty > 0 else None
         ask = Quote("SELL", round_price(ask_price), ask_qty) if ask_qty > 0 else None
-        return StrategyDecision(bid, ask, catchup=catchup)
+        return StrategyDecision(bid, ask, catchup=catchup, pace_mode=pace_mode)

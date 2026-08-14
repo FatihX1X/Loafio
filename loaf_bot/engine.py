@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import logging
 import logging.handlers
 import threading
@@ -24,8 +23,12 @@ class PreflightError(RuntimeError):
     pass
 
 
-class RiskLockTriggered(RuntimeError):
-    pass
+class RestartRequired(RuntimeError):
+    """A repeated local-state fault requires watchdog reconciliation."""
+
+
+class TradingPaused(RuntimeError):
+    """The exchange halt is temporary and should be retried by the watchdog."""
 
 
 def configure_logging(log_dir: Path) -> None:
@@ -73,11 +76,12 @@ class MakerBot:
         self._last_metrics_persist = 0.0
         self._last_leaderboard_persist = 0.0
         self._placing_blocked_until = 0.0
-        self._risk_breach_since: float | None = None
+        self._halt_until_mono = 0.0
         self._seen_trade_ids: set[str] = set()
         self._seen_trade_order: deque[str] = deque(maxlen=5_000)
         self._ws_auth_ok = threading.Event()
         self._portfolio_subscription_ok = threading.Event()
+        self._loop_faults: dict[str, deque[float]] = {}
 
     # ----------------------------- preflight ----------------------------- #
 
@@ -91,10 +95,7 @@ class MakerBot:
             self.config.session_id,
             equity,
             self.state.lifetime_volume,
-            self.config.loss_fraction,
         )
-        if self.session.status == "RISK_LOCKED":
-            raise RiskLockTriggered("This watchdog session is risk-locked.")
         self.store.event(self.config.session_id, "process_started", {"equity": equity})
 
         competition = self.client.competition.info()
@@ -128,7 +129,12 @@ class MakerBot:
             ),
             None,
         )
-        if target is None or str(value(target, "status", "")) != "LIVE":
+        if target is None:
+            raise PreflightError("Terafab is not listed as a tradeable property.")
+        target_status = str(value(target, "status", "")).upper()
+        if target_status in {"HALTED", "PAUSED"}:
+            raise TradingPaused(f"Terafab status is {target_status}.")
+        if target_status != "LIVE":
             raise PreflightError("Terafab is not a LIVE tradeable property.")
         with self._lock:
             self.state.market_price = float(value(target, "marketPrice", 0) or 0)
@@ -136,15 +142,14 @@ class MakerBot:
 
         detail = self.client.market.property(self.config.target_token)
         if bool(value(value(detail, "property", {}), "isHalted", False)):
-            raise PreflightError("Terafab trading is halted.")
+            raise TradingPaused("Terafab trading is halted.")
         self._seed_book(value(detail, "orderBook"))
         board = self.client.leaderboard.get()
         self._on_leaderboard(board)
         self._reconcile_active_orders()
         logger.info(
-            "Preflight passed: equity=%.2f floor=%.2f inventory=%.2f",
+            "Preflight passed: equity=%.2f loss_limit=disabled inventory=%.2f",
             equity,
-            self.session.loss_floor,
             self.state.inventory_notional(),
         )
 
@@ -186,6 +191,7 @@ class MakerBot:
         active = value(response, "activeOrders", []) or []
         known = {row["order_id"]: row for row in self.store.active_orders(self.config.session_id)}
         seen: set[int] = set()
+        unknown: list[int] = []
         for item in active:
             order_id = int(value(item, "orderId", value(item, "id", 0)) or 0)
             if not order_id:
@@ -193,9 +199,8 @@ class MakerBot:
             seen.add(order_id)
             row = known.get(order_id)
             if row is None:
-                raise PreflightError(
-                    f"Unknown active order #{order_id}; run 'python -m loaf_bot flatten' first."
-                )
+                unknown.append(order_id)
+                continue
             side = str(value(item, "side", row["side"]))
             remaining = float(value(item, "quantityLeft", row["remaining"]) or 0)
             order = OrderState(
@@ -219,6 +224,29 @@ class MakerBot:
         for order_id in known:
             if order_id not in seen:
                 self.store.update_order(order_id, 0.0, "CLOSED_ON_RECONCILE")
+        if unknown:
+            for order_id in unknown:
+                try:
+                    self.client.orders.cancel(order_id)
+                    self.store.event(
+                        self.config.session_id,
+                        "unknown_order_cancelled",
+                        {"orderId": order_id},
+                    )
+                    logger.warning("Cancelled unknown active order #%s during preflight", order_id)
+                except loaf.TradingHaltedError as exc:
+                    raise TradingPaused(
+                        f"Trading halted while cleaning unknown order #{order_id}."
+                    ) from exc
+                except (loaf.LoafConflictError, loaf.LoafNotFoundError):
+                    pass
+                except loaf.LoafError as exc:
+                    terminal = self._terminal_cancel_status(exc)
+                    if terminal is None:
+                        logger.warning("Unknown order #%s cleanup failed: %s", order_id, exc)
+            raise RestartRequired(
+                "unknown active orders were cleaned: " + ", ".join(map(str, unknown))
+            )
 
     # ------------------------------ websocket ---------------------------- #
 
@@ -330,6 +358,18 @@ class MakerBot:
         board = value(message, "leaderboard", message)
         entries = value(board, "entries", []) or []
         third = next((item for item in entries if int(value(item, "rank", 0) or 0) == 3), None)
+        own = next(
+            (
+                item
+                for item in entries
+                if bool(value(item, "isCurrentUser", False))
+                or int(value(item, "userId", 0) or 0) == self.config.user_id
+            ),
+            None,
+        )
+        if own is not None:
+            with self._lock:
+                self.state.round_volume = float(value(own, "volume", 0) or 0)
         if third is not None:
             rank3_volume = float(value(third, "volume", 0) or 0)
             with self._lock:
@@ -411,7 +451,51 @@ class MakerBot:
 
     # ------------------------------ orders ------------------------------- #
 
+    def _mark_trading_halted(self, source: str) -> None:
+        now = time.monotonic()
+        was_paused = now < self._halt_until_mono
+        self._halt_until_mono = now + self.config.halt_retry_seconds
+        if not was_paused:
+            logger.warning(
+                "Trading halted during %s; pausing order actions for %.0fs",
+                source,
+                self.config.halt_retry_seconds,
+            )
+            self.store.event(
+                self.config.session_id,
+                "trading_halted",
+                {"source": source, "retrySeconds": self.config.halt_retry_seconds},
+            )
+
+    def _record_loop_fault(self, signature: str) -> None:
+        now = time.monotonic()
+        window = self.config.loop_restart_window_seconds
+        faults = self._loop_faults.setdefault(signature, deque())
+        faults.append(now)
+        while faults and now - faults[0] > window:
+            faults.popleft()
+        if len(faults) >= self.config.loop_restart_threshold:
+            self.store.event(
+                self.config.session_id,
+                "watchdog_restart_requested",
+                {"signature": signature, "count": len(faults), "windowSeconds": window},
+            )
+            raise RestartRequired(
+                f"repeated order-state loop ({signature}, {len(faults)} events/{window:.0f}s)"
+            )
+
+    @staticmethod
+    def _terminal_cancel_status(exc: loaf.LoafError) -> str | None:
+        message = str(exc).upper()
+        marker = "CANNOT CANCEL ORDER WITH STATUS:"
+        if marker not in message:
+            return None
+        status = message.split(marker, 1)[1].strip().split()[0].strip(".,;:()[]{}")
+        return status if status in {"FILLED", "CANCELLED", "REJECTED"} else None
+
     def _cancel_side(self, side: str) -> None:
+        if time.monotonic() < self._halt_until_mono:
+            return
         with self._lock:
             order = self.state.bot_orders.get(side)
         if order is None or not order.active:
@@ -423,13 +507,35 @@ class MakerBot:
             status = "CANCEL_REQUESTED"
         except (loaf.LoafConflictError, loaf.LoafNotFoundError):
             status = "CLOSED_DURING_CANCEL"
+        except loaf.TradingHaltedError:
+            self._mark_trading_halted("cancel")
+            return
         except loaf.LoafError as exc:
+            terminal_status = self._terminal_cancel_status(exc)
+            if terminal_status is not None:
+                logger.info(
+                    "Order #%s is already %s; clearing stale local state",
+                    order.order_id,
+                    terminal_status,
+                )
+                with self._lock:
+                    order.status = terminal_status
+                    order.remaining = 0.0
+                    self.state.bot_orders.pop(side, None)
+                self.store.update_order(order.order_id, 0.0, terminal_status)
+                self.store.event(
+                    self.config.session_id,
+                    "stale_order_cleared",
+                    {"orderId": order.order_id, "status": terminal_status},
+                )
+                return
             logger.warning("Cancel failed for #%s: %s", order.order_id, exc)
             self.store.event(
                 self.config.session_id,
                 "cancel_failed",
                 {"orderId": order.order_id, "error": str(exc)},
             )
+            self._record_loop_fault(f"cancel_failed:{order.order_id}")
             return
         with self._lock:
             order.status = status
@@ -443,7 +549,7 @@ class MakerBot:
 
     def _place(self, quote: Quote) -> None:
         now = time.monotonic()
-        if now < self._placing_blocked_until:
+        if now < self._placing_blocked_until or now < self._halt_until_mono:
             return
         with self._lock:
             if now - self.state.book_updated_mono > self.config.stale_book_seconds:
@@ -463,6 +569,7 @@ class MakerBot:
                 ) or (quote.side == "SELL" and quote.price <= opposite.price)
                 if crosses_self:
                     logger.error("Self-trade guard blocked %s quote", quote.side)
+                    self._record_loop_fault(f"self_trade:{quote.side}:{opposite.order_id}")
                     return
         nonce_value: str | None = None
         try:
@@ -503,6 +610,10 @@ class MakerBot:
                 quote.price,
                 quote.notional,
             )
+        except loaf.TradingHaltedError:
+            if nonce_value:
+                self.store.update_nonce(nonce_value, "HALTED")
+            self._mark_trading_halted("order placement")
         except loaf.LoafRateLimitError as exc:
             if nonce_value:
                 self.store.update_nonce(nonce_value, "RATE_LIMITED")
@@ -604,40 +715,19 @@ class MakerBot:
         if now - self._last_equity_persist >= 2.0:
             self.store.update_equity(self.config.session_id, equity)
             self._last_equity_persist = now
-        if equity > self.session.loss_floor:
-            self._risk_breach_since = None
-            return
-
-        # Portfolio deltas may arrive out of order (cash before position or vice versa).
-        # Confirm a suspected breach with a one-shot REST snapshot before liquidating.
-        try:
-            component = self.client.portfolio.component()
-            self._seed_portfolio(component)
-            confirmed = float(
-                value(component, "portfolioValue", self.state.estimated_equity()) or 0
-            )
-            if confirmed > self.session.loss_floor:
-                self._risk_breach_since = None
-                return
-            equity = confirmed
-        except loaf.LoafError as exc:
-            logger.error("Risk-breach confirmation failed: %s", exc)
-            now = time.monotonic()
-            if self._risk_breach_since is None:
-                self._risk_breach_since = now
-                return
-            if now - self._risk_breach_since < 2.0:
-                return
-
-        if equity <= self.session.loss_floor:
-            reason = f"equity {equity:.2f} <= session floor {self.session.loss_floor:.2f}"
-            self.store.lock_session(self.config.session_id, reason, equity)
-            self.emergency_flatten()
-            raise RiskLockTriggered(reason)
 
     def _tick(self) -> None:
         assert self.session is not None
         self._risk_check()
+        now = time.monotonic()
+        if now < self._halt_until_mono:
+            if now - self._last_summary >= 5:
+                logger.warning(
+                    "Paused: exchange trading halt (retry in %.1fs)",
+                    self._halt_until_mono - now,
+                )
+                self._last_summary = now
+            return
         with self._lock:
             decision = self.strategy.decide(
                 self.state,
@@ -645,9 +735,13 @@ class MakerBot:
             )
             inventory = self.state.inventory_notional()
             equity = self.state.estimated_equity()
-            own_volume = max(0.0, self.state.lifetime_volume - self.session.start_volume)
+            source_volume = (
+                self.state.lifetime_volume
+                if self.state.round_volume is None
+                else self.state.round_volume
+            )
+            own_volume = max(0.0, source_volume)
             podium_target, _rank3_rate = self.strategy.podium_target(self.state)
-        now = time.monotonic()
         if now - self._last_metrics_persist >= 2.0:
             self.store.update_metrics(
                 self.config.session_id,
@@ -668,11 +762,11 @@ class MakerBot:
         self._ensure_quote("SELL", decision.ask)
         if now - self._last_summary >= 10:
             logger.info(
-                "equity=%.2f inventory=%.2f sessionVolume=%.2f catchup=%s",
+                "equity=%.2f inventory=%.2f roundVolume=%.2f paceMode=%s",
                 equity,
                 inventory,
                 own_volume,
-                decision.catchup,
+                decision.pace_mode,
             )
             self._last_summary = now
 
@@ -766,17 +860,36 @@ class MakerBot:
                 )
                 passive_order_id = int(value(response, "orderId", 0) or 0)
                 self.store.update_nonce(nonce_value, "GRACEFUL_EXIT", passive_order_id or None)
+                if passive_order_id:
+                    passive_quantity = round(quantity, 1)
+                    self.store.save_order(
+                        self.config.session_id,
+                        passive_order_id,
+                        "SELL",
+                        ask,
+                        passive_quantity,
+                        passive_quantity,
+                        "OPEN",
+                    )
             while passive_order_id and time.monotonic() < deadline:
                 time.sleep(2)
                 component = self.client.portfolio.component()
                 self._seed_portfolio(component)
                 if self.state.available_quantity <= 0:
+                    self.store.update_order(passive_order_id, 0.0, "FILLED")
                     return
         except loaf.LoafError as exc:
             logger.warning("Passive graceful exit failed: %s", exc)
         if passive_order_id:
-            with contextlib.suppress(loaf.LoafError):
+            try:
                 self.client.orders.cancel(passive_order_id)
+                self.store.update_order(passive_order_id, 0.0, "CANCEL_REQUESTED")
+            except loaf.LoafError as exc:
+                terminal = self._terminal_cancel_status(exc)
+                if terminal:
+                    self.store.update_order(passive_order_id, 0.0, terminal)
+                else:
+                    logger.warning("Graceful exit order cancel failed: %s", exc)
         try:
             component = self.client.portfolio.component()
             self._seed_portfolio(component)

@@ -32,10 +32,12 @@ class BotConfig:
     target_inventory_usdl: float = 30_000.0
     lower_inventory_usdl: float = 24_000.0
     upper_inventory_usdl: float = 36_000.0
-    max_inventory_usdl: float = 60_000.0
-    base_quote_usdl: float = 10_000.0
-    catchup_quote_usdl: float = 15_000.0
-    loss_fraction: float = 0.25
+    max_inventory_usdl: float = 80_000.0
+    base_quote_usdl: float = 15_000.0
+    catchup_quote_usdl: float = 25_000.0
+    sprint_quote_usdl: float = 40_000.0
+    catchup_pace_ratio: float = 0.75
+    sprint_pace_ratio: float = 0.25
     stale_book_seconds: float = 2.0
     volatility_window_seconds: float = 10.0
     volatility_limit_bps: float = 50.0
@@ -44,6 +46,9 @@ class BotConfig:
     toxic_flow_min_notional: float = 2_500.0
     pause_seconds: float = 5.0
     loop_interval_seconds: float = 0.5
+    loop_restart_threshold: int = 6
+    loop_restart_window_seconds: float = 10.0
+    halt_retry_seconds: float = 15.0
     graceful_flatten_seconds: float = 30.0
 
     @classmethod

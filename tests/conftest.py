@@ -28,6 +28,7 @@ class FakeOrders:
         self.cancel_all_count = 0
         self.market_sells: list[float] = []
         self.create_error = None
+        self.cancel_error = None
 
     def nonce(self):
         self.nonce_count += 1
@@ -41,6 +42,8 @@ class FakeOrders:
 
     def cancel(self, order_id):
         self.cancelled.append(order_id)
+        if self.cancel_error:
+            raise self.cancel_error
         return {"success": True, "orderId": order_id}
 
     def cancel_all(self):
@@ -53,7 +56,9 @@ class FakeOrders:
 
 
 class FakeClient:
-    def __init__(self, *, equity=100_000.0, quantity=300.0, active_orders=None) -> None:
+    def __init__(
+        self, *, equity=100_000.0, quantity=300.0, active_orders=None, halted=False
+    ) -> None:
         self.orders = FakeOrders()
         self.closed = False
         position = {
@@ -94,7 +99,7 @@ class FakeClient:
                 ]
             },
             property=lambda _token: {
-                "property": {"tokenName": "terafab", "isHalted": False},
+                "property": {"tokenName": "terafab", "isHalted": halted},
                 "orderBook": {
                     "bids": [{"price": 99.99, "quantity": 1000}],
                     "asks": [{"price": 100.00, "quantity": 1000}],
@@ -107,6 +112,7 @@ class FakeClient:
                     {"rank": 1, "volume": 10_000},
                     {"rank": 2, "volume": 9_000},
                     {"rank": 3, "volume": 8_000},
+                    {"rank": 10, "userId": 123, "volume": 1_234},
                 ]
             }
         )

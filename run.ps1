@@ -32,18 +32,18 @@ while ($true) {
         Write-Host 'Bot normal olarak durdu.'
         break
     }
-    if ($exitCode -eq 25) {
-        Write-Error 'Oturum %25 risk limitinde kilitlendi. Watchdog yeniden baslatmayacak.' -ErrorAction Continue
-        $finalExitCode = $exitCode
-        break
-    }
     if ($exitCode -eq 64 -or $exitCode -eq 65) {
         Write-Error "Kalici yapilandirma/preflight hatasi (exit $exitCode). Watchdog durdu." -ErrorAction Continue
         $finalExitCode = $exitCode
         break
     }
+    if ($exitCode -eq 71) {
+        Write-Warning 'LOAF islemleri gecici olarak durdurulmus. Watchdog 15 saniye sonra yeniden kontrol edecek.'
+        Start-Sleep -Seconds 15
+        continue
+    }
 
-    Write-Warning "Bot beklenmedik sekilde kapandi (exit $exitCode). Ayni oturum ve ayni zarar tabaniyla 5 saniye sonra yeniden baslatiliyor."
+    Write-Warning "Bot yeniden baslatma gerektiren bir durumla kapandi (exit $exitCode). Ayni oturumla 5 saniye sonra yeniden baslatiliyor."
     Start-Sleep -Seconds 5
 }
 
